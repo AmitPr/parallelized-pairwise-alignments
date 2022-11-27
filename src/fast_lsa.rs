@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use crate::{Aligner, Alignment};
 
 const DEFAULT_BLOCKSIZE: usize = 10;
@@ -32,6 +34,11 @@ impl<'a> Aligner<'a> for FastLSAAligner<'a> {
         let mut cached_rows = vec![vec![0; self.a.len() + 1]; num_cached_rows];
         let mut cached_cols = vec![vec![0; self.b.len() + 1]; num_cached_cols];
 
+        let visited_blocks = Arc::new(Mutex::new(vec![
+            vec![false; num_cached_cols - 1];
+            num_cached_rows - 1
+        ]));
+
         /*
          * 1. Fill in the cache grid
          */
@@ -44,53 +51,19 @@ impl<'a> Aligner<'a> for FastLSAAligner<'a> {
             cached_cols[0][i + 1] = cached_cols[0][i] + score(b'-', *char);
         });
 
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back((0, 0));
-
-        while let Some((row, col)) = queue.pop_front() {
-            let row_start = col * self.block_size;
-            let row_end = ((col + 1) * self.block_size).min(self.b.len());
-            let col_start = row * self.block_size;
-            let col_end = ((row + 1) * self.block_size).min(self.a.len());
-
-            // Correctness: We never mutably borrow the same parts of a row or column twice
-            unsafe {
-                let start_row = cached_rows.get_unchecked(row)[row_start..=row_end].as_ptr();
-                let start_col = cached_cols.get_unchecked(col)[col_start..=col_end].as_ptr();
-                let output_row =
-                    cached_rows.get_unchecked_mut(row + 1)[row_start..=row_end].as_mut_ptr();
-                let output_col =
-                    cached_cols.get_unchecked_mut(col + 1)[col_start..=col_end].as_mut_ptr();
-                // convert pointers to slices
-                let start_row = std::slice::from_raw_parts(start_row, row_end - row_start + 1);
-                let start_col = std::slice::from_raw_parts(start_col, col_end - col_start + 1);
-                let output_row =
-                    std::slice::from_raw_parts_mut(output_row, row_end - row_start + 1);
-                let output_col =
-                    std::slice::from_raw_parts_mut(output_col, col_end - col_start + 1);
-
-                Self::fill_grid_block(
-                    &self.a[row_start..row_end],
-                    &self.b[col_start..col_end],
-                    start_row,
-                    start_col,
-                    output_row,
-                    output_col,
-                    score,
-                );
-            }
-
-            if row + 1 < num_cached_rows - 1 {
-                queue.push_back((row + 1, col));
-            }
-            if col + 1 < num_cached_cols - 1 {
-                queue.push_back((row, col + 1));
-            }
-        }
+        self.forward(
+            0,
+            0,
+            cached_rows.as_mut_slice(),
+            cached_cols.as_mut_slice(),
+            score,
+            visited_blocks,
+        );
 
         /*
          * 2. Backtrace
          */
+
         todo!("implement fast lsa backtrace")
     }
 }
@@ -99,6 +72,103 @@ impl<'a> FastLSAAligner<'a> {
     pub fn with_block_size(mut self, block_size: usize) -> Self {
         self.block_size = block_size;
         self
+    }
+
+    pub fn forward(
+        &self,
+        row: usize,
+        col: usize,
+        cached_rows: &mut [Vec<i32>],
+        cached_cols: &mut [Vec<i32>],
+        score: fn(u8, u8) -> i32,
+        visited_blocks: Arc<Mutex<Vec<Vec<bool>>>>,
+    ) {
+        visited_blocks.lock().unwrap()[row][col] = true;
+
+        let row_start = col * self.block_size;
+        let row_end = ((col + 1) * self.block_size).min(self.b.len());
+        let col_start = row * self.block_size;
+        let col_end = ((row + 1) * self.block_size).min(self.a.len());
+
+        // Correctness: We never mutably borrow the same parts of a row or column twice
+        unsafe {
+            let start_row = cached_rows.get_unchecked(row)[row_start..=row_end].as_ptr();
+            let start_col = cached_cols.get_unchecked(col)[col_start..=col_end].as_ptr();
+            let output_row =
+                cached_rows.get_unchecked_mut(row + 1)[row_start..=row_end].as_mut_ptr();
+            let output_col =
+                cached_cols.get_unchecked_mut(col + 1)[col_start..=col_end].as_mut_ptr();
+            // convert pointers to slices
+            let start_row = std::slice::from_raw_parts(start_row, row_end - row_start + 1);
+            let start_col = std::slice::from_raw_parts(start_col, col_end - col_start + 1);
+            let output_row = std::slice::from_raw_parts_mut(output_row, row_end - row_start + 1);
+            let output_col = std::slice::from_raw_parts_mut(output_col, col_end - col_start + 1);
+
+            Self::fill_grid_block(
+                &self.a[row_start..row_end],
+                &self.b[col_start..col_end],
+                start_row,
+                start_col,
+                output_row,
+                output_col,
+                score,
+            );
+        }
+        // Correctness: We can assure ourselves that cached_rows and cached_cols are not
+        // dropped before the forward call is finished. We can also assure ourselves that
+        // the mutable pointers that we pass are not used to mutate the same parts of the
+        // cache vectors twice.
+        unsafe {
+            let num_cached_rows = cached_rows.len();
+            let num_cached_cols = cached_cols.len();
+            let cached_rows_ptr = cached_rows.as_mut_ptr() as usize;
+            let cached_cols_ptr = cached_cols.as_mut_ptr() as usize;
+
+            let visited_blocks_2 = Arc::clone(&visited_blocks);
+            rayon::join(
+                || {
+                    if row + 1 < num_cached_rows && !visited_blocks.lock().unwrap()[row + 1][col] {
+                        let cached_rows = std::slice::from_raw_parts_mut(
+                            cached_rows_ptr as *mut Vec<i32>,
+                            num_cached_rows - row - 1,
+                        );
+                        let cached_cols = std::slice::from_raw_parts_mut(
+                            cached_cols_ptr as *mut Vec<i32>,
+                            num_cached_cols - row,
+                        );
+                        self.forward(
+                            row + 1,
+                            col,
+                            cached_rows,
+                            cached_cols,
+                            score,
+                            visited_blocks,
+                        );
+                    }
+                },
+                || {
+                    if col + 1 < num_cached_cols && !visited_blocks_2.lock().unwrap()[row][col + 1]
+                    {
+                        let cached_rows = std::slice::from_raw_parts_mut(
+                            cached_rows_ptr as *mut Vec<i32>,
+                            num_cached_rows - row,
+                        );
+                        let cached_cols = std::slice::from_raw_parts_mut(
+                            cached_cols_ptr as *mut Vec<i32>,
+                            num_cached_cols - col - 1,
+                        );
+                        self.forward(
+                            row,
+                            col + 1,
+                            cached_rows,
+                            cached_cols,
+                            score,
+                            visited_blocks_2,
+                        );
+                    }
+                },
+            );
+        }
     }
 
     pub fn fill_grid_block(
