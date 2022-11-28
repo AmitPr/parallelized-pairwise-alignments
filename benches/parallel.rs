@@ -26,15 +26,18 @@ fn bench_group(c: &mut Criterion) {
 
 fn read_sequences(file: &str) -> (Vec<u8>, Vec<u8>) {
     // seq1 is first line, seq2 is second line
-    let mut seq1 = Vec::new();
-    let mut seq2 = Vec::new();
+    let mut seq1 = String::new();
+    let mut seq2 = String::new();
     // cwd + "/benches/{file}"
     let path = std::env::current_dir().unwrap().join("benches").join(file);
     let file = File::open(path).unwrap();
     let mut reader = BufReader::new(file);
-    reader.read_until(b'\n', &mut seq1).unwrap();
-    reader.read_until(b'\n', &mut seq2).unwrap();
-    (seq1, seq2)
+    reader.read_line(&mut seq1).unwrap();
+    reader.read_line(&mut seq2).unwrap();
+    (
+        seq1.trim().as_bytes().to_vec(),
+        seq2.trim().as_bytes().to_vec(),
+    )
 }
 
 criterion_group! {
