@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::{Aligner, Alignment};
 
-const DEFAULT_BLOCKSIZE: usize = 10;
+const DEFAULT_BLOCKSIZE: usize = 150;
 
 pub struct FastLSAAligner<'a> {
     a: &'a [u8],
@@ -28,15 +28,17 @@ impl<'a> Aligner<'a> for FastLSAAligner<'a> {
             return crate::sequential::HirschbergAligner::with(self.a, self.b, score).align();
         }
 
-        let num_cached_rows = self.b.len() / self.block_size + 2;
-        let num_cached_cols = self.a.len() / self.block_size + 2;
+        let num_grid_rows = (self.b.len() + self.block_size - 1) / self.block_size;
+        let num_grid_cols = (self.a.len() + self.block_size - 1) / self.block_size;
+        let num_cached_rows = num_grid_rows + 1;
+        let num_cached_cols = num_grid_cols + 1;
 
         let mut cached_rows = vec![vec![0; self.a.len() + 1]; num_cached_rows];
         let mut cached_cols = vec![vec![0; self.b.len() + 1]; num_cached_cols];
 
         let visited_blocks = Arc::new(Mutex::new(vec![
-            vec![false; num_cached_cols - 1];
-            num_cached_rows - 1
+            vec![false; num_cached_cols];
+            num_cached_rows
         ]));
 
         /*
@@ -63,8 +65,50 @@ impl<'a> Aligner<'a> for FastLSAAligner<'a> {
         /*
          * 2. Backtrace
          */
+        let mut last_a = &self.a[(num_grid_cols - 1) * self.block_size..];
+        let mut last_b = &self.b[(num_grid_rows - 1) * self.block_size..];
+        let mut start_row = &cached_rows[num_grid_rows][self.a.len() - last_a.len()..];
+        let mut start_col = &cached_cols[num_grid_cols][self.b.len() - last_b.len()..];
+        let mut start_idx = (last_a.len(), last_b.len());
+        let mut next_row = num_grid_rows - 1;
+        let mut next_col = num_grid_cols - 1;
 
-        todo!("implement fast lsa backtrace")
+        let mut alignment = vec![];
+        let mut alignment_score = cached_rows.last().unwrap().last().unwrap();
+
+        loop {
+            let result = Self::backtrace_grid_cell(
+                last_a, last_b, start_row, start_col, start_idx, next_row, next_col, score,
+            );
+            alignment.splice(0..0, result.0.alignment);
+
+            if next_row == 0 && next_col == 0 {
+                break;
+            }
+            // (sub_alignment, start_idx, next_row, next_col)
+            if next_row > result.2 {
+                start_idx = (self.block_size, result.1);
+            } else {
+                start_idx = (result.1, self.block_size);
+            }
+            next_row = result.2;
+            next_col = result.3;
+
+            last_a = &self.a
+                [next_col * self.block_size..((next_col + 1) * self.block_size).min(self.a.len())];
+            last_b = &self.b
+                [next_row * self.block_size..((next_row + 1) * self.block_size).min(self.b.len())];
+
+            start_row = &cached_rows[next_row][next_col * self.block_size
+                ..((next_col + 1) * self.block_size + 1).min(self.a.len() + 1)];
+            start_col = &cached_cols[next_col][next_row * self.block_size
+                ..((next_row + 1) * self.block_size + 1).min(self.b.len() + 1)];
+        }
+
+        Alignment {
+            alignment,
+            score: *alignment_score,
+        }
     }
 }
 
@@ -83,6 +127,10 @@ impl<'a> FastLSAAligner<'a> {
         score: fn(u8, u8) -> i32,
         visited_blocks: Arc<Mutex<Vec<Vec<bool>>>>,
     ) {
+        let num_grid_rows = (self.b.len() + self.block_size - 1) / self.block_size;
+        let num_grid_cols = (self.a.len() + self.block_size - 1) / self.block_size;
+        assert!(row < num_grid_rows, "row out of bounds");
+        assert!(col < num_grid_cols, "col out of bounds");
         visited_blocks.lock().unwrap()[row][col] = true;
 
         let row_start = col * self.block_size;
@@ -113,6 +161,7 @@ impl<'a> FastLSAAligner<'a> {
                 output_col,
                 score,
             );
+            println!("{}x{}: Input row: {:?}, Output row: {:?}", row, col, start_row, output_row);
         }
         // Correctness: We can assure ourselves that cached_rows and cached_cols are not
         // dropped before the forward call is finished. We can also assure ourselves that
@@ -127,14 +176,18 @@ impl<'a> FastLSAAligner<'a> {
             let visited_blocks_2 = Arc::clone(&visited_blocks);
             rayon::join(
                 || {
-                    if row + 1 < num_cached_rows && !visited_blocks.lock().unwrap()[row + 1][col] {
+                    if row + 1 < num_grid_rows
+                        && !visited_blocks
+                            .lock()
+                            .unwrap_or_else(|_| panic!("Could not lock mutex"))[row + 1][col]
+                    {
                         let cached_rows = std::slice::from_raw_parts_mut(
                             cached_rows_ptr as *mut Vec<i32>,
-                            num_cached_rows - row - 1,
+                            num_cached_rows,
                         );
                         let cached_cols = std::slice::from_raw_parts_mut(
                             cached_cols_ptr as *mut Vec<i32>,
-                            num_cached_cols - row,
+                            num_cached_cols,
                         );
                         self.forward(
                             row + 1,
@@ -147,24 +200,29 @@ impl<'a> FastLSAAligner<'a> {
                     }
                 },
                 || {
-                    if col + 1 < num_cached_cols && !visited_blocks_2.lock().unwrap()[row][col + 1]
+                    if col + 1 < num_grid_cols
+                        && !visited_blocks_2
+                            .lock()
+                            .unwrap_or_else(|_| panic!("Could not lock mutex"))[row][col + 1]
                     {
-                        let cached_rows = std::slice::from_raw_parts_mut(
-                            cached_rows_ptr as *mut Vec<i32>,
-                            num_cached_rows - row,
-                        );
-                        let cached_cols = std::slice::from_raw_parts_mut(
-                            cached_cols_ptr as *mut Vec<i32>,
-                            num_cached_cols - col - 1,
-                        );
-                        self.forward(
-                            row,
-                            col + 1,
-                            cached_rows,
-                            cached_cols,
-                            score,
-                            visited_blocks_2,
-                        );
+                        {
+                            let cached_rows = std::slice::from_raw_parts_mut(
+                                cached_rows_ptr as *mut Vec<i32>,
+                                num_cached_rows,
+                            );
+                            let cached_cols = std::slice::from_raw_parts_mut(
+                                cached_cols_ptr as *mut Vec<i32>,
+                                num_cached_cols,
+                            );
+                            self.forward(
+                                row,
+                                col + 1,
+                                cached_rows,
+                                cached_cols,
+                                score,
+                                visited_blocks_2,
+                            );
+                        }
                     }
                 },
             );
@@ -206,6 +264,96 @@ impl<'a> FastLSAAligner<'a> {
         // Fill output row
         output_row.copy_from_slice(&scores.1);
     }
+
+    /// Returns: (alignment, next_start_idx, next_row, next_col)
+    pub fn backtrace_grid_cell(
+        a: &[u8],
+        b: &[u8],
+        start_row: &[i32],
+        start_col: &[i32],
+        start_idx: (usize, usize),
+        row: usize,
+        col: usize,
+        score: fn(u8, u8) -> i32,
+    ) -> (Alignment, usize, usize, usize) {
+        // println!("Backward: row: {}, col: {}", row, col);
+        let n = a.len();
+        let m = b.len();
+        let mut scores = vec![vec![0; n + 1]; m + 1];
+        let mut backtrack = vec![vec![0; n + 1]; m + 1];
+        if row == 0 {
+            for j in 0..n {
+                backtrack[0][j + 1] = 2;
+            }
+        }
+        if col == 0 {
+            for i in 0..m {
+                backtrack[i + 1][0] = 1;
+            }
+        }
+        scores[0] = start_row.to_vec();
+        for i in 0..m {
+            scores[i + 1][0] = start_col[i + 1];
+            for j in 0..n {
+                let nexts = vec![
+                    scores[i][j] + score(a[j], b[i]),     // substitution
+                    scores[i][j + 1] + score(b'-', b[i]), // deletion (go down)
+                    scores[i + 1][j] + score(a[j], b'-'), // insertion (go right)
+                ];
+                let max_score = *nexts.iter().max().unwrap();
+                backtrack[i + 1][j + 1] = nexts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &s)| s == max_score)
+                    .map(|(i, _)| i)
+                    .next()
+                    .unwrap();
+                scores[i + 1][j + 1] = max_score;
+            }
+        }
+
+        let mut i = start_idx.0;
+        let mut j = start_idx.1;
+        let mut alignment = Vec::new();
+        let condition = |i: usize, j: usize| {
+            if row == 0 && col == 0 {
+                i > 0 || j > 0
+            } else {
+                i > 0 && j > 0
+            }
+        };
+        while condition(i, j) {
+            match backtrack[i][j] {
+                0 => {
+                    alignment.push((a[j - 1] as char, b[i - 1] as char));
+                    i -= 1;
+                    j -= 1;
+                }
+                1 => {
+                    alignment.push(('-', b[i - 1] as char));
+                    i -= 1;
+                }
+                2 => {
+                    alignment.push((a[j - 1] as char, '-'));
+                    j -= 1;
+                }
+                _ => unreachable!(),
+            }
+        }
+        alignment.reverse();
+        let alignment = Alignment {
+            score: scores[start_idx.0][start_idx.1],
+            alignment,
+        };
+        if row == 0 && col == 0 {
+            (alignment, 0, 0, 0)
+        } else {
+            let next_start_idx = if i > 0 { i } else { j };
+            let next_row = if i > 0 { row } else { row - 1 };
+            let next_col = if i > 0 { col - 1 } else { col };
+            (alignment, next_start_idx, next_row, next_col)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -214,10 +362,11 @@ mod tests {
 
     #[test]
     fn doit() {
-        let a = b"CCGTTATGCTCCATTTCGG";
-        let b = b"CCTGCGCTATCTGCCTGTC";
+        let a = b"ATCTAACTATTCCCTGTGCCTTATGGGGGCCTGCGCTATCTGCCTGTCGAACCATAGGACTCGCGCCAGCGCGCAGGCTTGGATCGAGGTGAAATCTCCGGGGCCTAAGACCACGAGCGTCTGGCGTCTTGGCTAACCCCCCTACATGCTGTTATAGACAATCAGTGGAAACCCGGTGCCAGGGGGTGGAGTGACCTTAAGTCAGGGACGATATTAATCGGAAGGAGTATTCAACGCAATGAAGCCGCAGGGTTGGCGTGGGAATGGTGCTTCTGTCCAAGCAGGTAAGGGCATGAGGCCGCAACCGTCCCCCAAGCGTACAGGGTGCACTTTGCAACGATTTCGGAGTCCGGAGACTCGCTGTTTTCGAAATTTGCGCTCAAGGGCGGGTATTGAACCAGGCTTACGCCCAAGAACGTAGCAAGGTGACTCAAACAAGGTACATCTTGCCCGCGTTTCACACGAATCAAGTTGGAGGTTATGGAGCATAGTAACACGTGGGCGGCCAGTGGTCGGTTGCTACACCCCTGCCGCAACGTTGAAGGTCCCGGATTAGACTGGCTGGACCCATGCCGTGACACCCGTCACACTCCATTACCGTCTGCGGGTCACGGCTTGTTGTGGACTGGATTGCCATTCTCTCAGTGTATTACGCAGGCCGGCGCGCGGGTCCCATGTAAACCTGTCATAGCTTACCTGACTCTACTTGGAAGTGTGGCTAGGCCTTTGCCCACGCACCTGGTCGGTCCTCGTTTGCTTTTTAGGACCGGATGAACTACAGAGCGCTGCAAGAATCTCTACCTGCTTTACAAAGCGCTGGGTCCTACTCCAGCGGGATGTTTTATCTAAACACGATGAGAGGAGTATTCGTCAGGCCACATGGCTTTCTTGTCCTGGTCGGATCCATCGTTGGCGCCCGACCCCCCCACTCCGTAGTGAGTTCTTCGTCCGAGCCATTGCATGCCAGATCGGCAGACAGATAGCGGATCCAGTATATCCCTGGAAGCTATAGACGCACAGGTTGGAATCCTAAGCGAAGTCGCGCGTCCGAACCCAGCTCTACTTTAGTGGCCACGGGTTCTGGTCCCCCCGGGCCGCGGAACCGATTAGGGCCATGTACAACAATACTTATTAGTCACCTTTCAGACACGATCTCCCTGCTCAGTGGTATATGGTTCCTGCTATAATTAGCCACCCTCATAAGTTGCACTACTTCTGCGACCCAAGTGCACCCTTACCACGAAGACAGGATTGTCCGATCCCATACTGCGGCCTTGGCAGGGGGTTCGCAAGTCCCACCCCAAACGATGCTGAAGGCTCAGGTTACACAGGCACAAGTGCTATATACGCGAGTTCCCGCTCTTAACCTGGACCGAATGCGGGATCATGCATCGTACCACTGTGTTCGTGTCATCTAGGACGGGCGCAAAGGATACATAGTTCAATCAAGAATACCTTGTATTATTGTACACCTACCGGTCACCAGCCAACAATGTGCGGACGGCGTTGCGACTTGCTGGGCCTGATCTCACCGCCCTAGATACCGCACACTGGGCAATACGAGGTAAAGCCAGTCACCCAGTGTCGATCAACAGCTGACGTAACGGTAAGAGGCTCACAAAATCGCACCGCCGGCGTCCCCTGGGTATTTTACGTCAGCATCGGGTGGACTGGCATGAATCTTTACTCCCAGGCGGAAACGGGTGCGTGGACAAGCGAGCAGCAAACGAAAATTCCTGGCCTGCTTGGTGTCTCGTATCCCTCTTGGAGATCGAGGAAATGTTTCACGACCAAGGGAAAGGTCGCCCTACGAAATAGATTTGCGCTACTGTCCGCATAAGGAGTCCGGTGTAGCGAAGGATGAAGGCGACCCTAGGTAGCAACCGCCGGCTTCGGCGGTAAGGTATCACTCAGGAAGCAGGCACGGAAAGACACGGTCTAGCAGACCGTCTATCGGCTAGGTCAAATAGGGTGCTTTGATATCAGCATGTCCAGCCTTAGAATTCAGTTCAGCGCGCTGGTCTGGGTCGAGATAAAATCACCAGTACCCAAGACCAGGCGGGCTCGCCGCGTTGGCTAATCCTGGTACATCTTGTAATCAATGTTCAGAAGAAAATCTGTGTTAGAGGGACGAGTCACCACGTACCAATAGCGACAACGATCGGTCGGACTATTCATCGTGGTGGTGACGCTCGGATTACGCGGGAAAGGTGCTTGTGTCCCGACAGGCTAGGATATAATGCTGAGGCGCTGCCCCAACCGTTCAGCGTGGGGTTTGCTACAACTTCCGAGTGCTACGTGTGCGAGACCATGTTATGTATGCACAAGGCCGACAATAGGACGTAGCCTTCGAGTTAGTACGTAGCGTGGTCGCACAAGCACAGTAGATCCTCCCCGCGCATCCTATTTATTAAGTTAATTCTATAGCAATACGATCACATGCGGATGGGCAGTGGCCGGTAGTCACACGCCTACCGCGGTGCTCAATGACCGGGACTAGAGAGGCGAAGATTATGGCGTGTGACCCGTTATGCTCGAGTTCGGTCAGAGCGTCATTGCGAGTAGTCGATTGCTTTCCCAATCTCCGAGCGATTTAGCGTGACAGCCCCAGGGAACCCACAAAATGCGATCGCAGTCCACCCGATCGTACACAGAAAGGAGGGTCCCCATACGCCGACGCACCTGTTCGCACGTCGTATGCATAAACGAGCCGCACGAACCAGAGAGCATAAAGAGGACCTCTAGCTCCTTTACAAAGTACAGGTTCGCCTGCCGCCGGGATGCCTTACCTAGACGCAATGACGGACGTATTCCTCTGGCCTCAACGGTTCCTGCTTCCGCTGGGATCCAAGATTGGCGGCCGAAGCCGCCTTTCCAAAGTGAGTCCTTCGTCTGTGACTAACTGTGCCAGATCGTCTTGCAAACTCCCGATCCAGTTTAACTCACCAAACTATAGCCGTACAGACCCAAATCTTAAGTCATATCACGCGACTAGCCTCTGCTCAATTTCTGTGCTCAAGGGTTTTGGTCCGCCCGAGCGGTGCAGCCGATTAGGACCATCTAATGCACTTGTTACAAGACTTCTTTTAAACACTTTCTTCCTGCCCAGTGGCGGATGATAATGGTTGTTGCCAGCCGGCGTGGAAGGTAACAGCACCGGTGCGAGCCTAATGTGCCGTCTCCACCAACACAGGGCTGTCCGGTCGTATAATAGGACTCCGCAATGGGGTTAGCAAGTGGCAGCCTAAACGATGTCGGGGACTCGCGATGTACATGCTCTGGTTCAATACATACGTGACCCGGCAGTTATCCTGCATCGGAACGTCAATCGTGCATCGGGCCAGCGTAATCGTGTCATCTGGGAGGCGGCCGTAGGATAAATAATTCAATAAAGATGTCGTTTTGCTAGTATACGCCTAGGCGTCACCCGCCATCTCTGTGCAGGTGGGCCGACGAGACACTGCCCCTGATTTCTCCGCTACTAATAGCACACACGGGGCAATACCAGCACAAGCCAGTCTCGCGGGAACGCTCGTCAGCATACGAAAGAGCTTGAGGCACGCCAATTCGCACTGTCGGGGTCGCTTGGGTGTTTTGCACTACCGTCAGGTACGCTAGTATGCGTCCTTCCTTCCAGGGGTATGTGGCTGCGTGGTCAAAAGTGCGGCATTCGTATTTGCTCCCCGTGCTTGCTCTCACGAACTTGACCTGGAGATCAAGGAGATGCTTCTTGTGGAACCGGACAGCGCATCAACGCAACGGATCTACGTTACAGCGTGCATAGCGAGAACGGAGTTGCCGACGACGAAAGCGACACTGGGATCTGTCCGTCGTCATTCGCGGAAAGCATCCGCTCACGAGGCGGACACTGATTGACACGGTTTTGCAGAAGGTTAGGGGAATAGGTCAAATTGAGTGGCTTAAAAACGCTATGTCTGGGATTAAAGTGTAGTAAACTGCGGTCAACGGAGACGGTTTTAAGACAGGAGTTCGCAAAACCAGGCGGGGTCGCCACGACGGCTATTCCTGGTGGTTTAGGCGTACAATGTCCTGAAGAATATTTAAGAAAGAAGCACCCCTCGTCGCCTAGAATTACCTACCGCGGTCGACCATACCTTCGATTGTCGCGCCCACCCTCCCATTAGTCGGCAGAGGTGGTTGTGTTGCGATAGCCCAGCATGATATCCTAAGGCGTTACGCCGATGGATATCCCACGGAATTGCCATAGGCGCTGAACGCTACACGGACGATACGAACTTATGTATGGAGCGGGTCATCGAAAGGTCATACCCTTGTAGTTAACATGTAGCCCGGCCCTATTAGTACAGCAGTGCCTTGAGCGGCATTCTCATTATTAAGTTTTCTCTACAGCCAAACGACCAAGTGCACTTCCGCGGAGCGCGGTGGAGACTCGTCCACCCGGCAGCTCTGTAATAGGGACTAAAAGAGTGATGATAATCATGAGTGCCGCGTTATGGTGGTGTCGGAACAGAGCGGTCTTACGGCCAGTCGTATCCCTTCTCGAGTTCCGTCCGGTTAAGCGTGACACTCCCAGTGTACCCGCAAACCGTGATGGCTGTGCTTGGGGTCAATCGCATGTAGGATGGTCTCCAGACACCGGGGCACCAGTTTTCACGCCCAAAGCATAAACGACGAGCAGTCATGAGAGTCTTAGAACTGGACGTGCCGTTTCTCTGCGAACAACACCTCGAGCTGTACCGTTGTTGCGCTGCCTAGATGCAGTGCCGCTCCTATCACATTTGCCTCGACGACTGCCGCCTTCGCTGTTTCCCTAGACACTCAACAGTAAGCGCCTTTTGTAGGCAGGGGCACCCCCTGTCAGTGGCTGCGCCAAAACGTCTTCGGATCCCCTTGTCCAATCAAACTGACCGAATTCTTTCATTTAAGACCCTAATATGACATCATTAGTGACTAAATGCCACTCCCAAAATTCTGCCCAGAAGCGTTTAAGTTCGCCCCACTAAAGTTGTCTAAAACGA";
+        let b = b"CTAAAGTGGCGAAATTTATGGTGTGTGACCCGTTATGCTCCATTTCGGTCAGTGGGTCATTGCTAGTAGTCGATTGCATTGTCATTCTCCGAGTGATTTAGCGTGACAGCCGCAGGGAACCCATAAAATGTAATCGTAGTCCATCTGATCGTACTTAGAAATGAAGGTCCCCTTTTACCCACGCACCTGTTTACTCGTCGTTTGCTTTTAAGAACCGCACGAACCACAGAGCATAAAGAGAACCTCTAGTTCCTTTACAAAGTACTGGTTCCCTTTTCAGCAAGATGCCTTATCTAAATGCAATGACAGACGTATTCCTCAGGCCACATCGCTTCCTACTTTCGCTGGGATCCATCATTGGCAGCTGAAACCGCCATTCCATAGTGAGTCCTTCGTCTGTGTCTTTCTGTGCCAAATCGTCTAGCAAATTGCTGATCCAGTTTATCTCACGAAATTATAGTCATACAGACCGAAATTTTAAATCAAATCACGCGACTAGGCTCAGCTTTATTTTAGTGGTCATGGGTTTTGGTCCGCCCGAGCGGTGCAACCGATTAGGACCATGTAAAACATTTGTTACAAGTCTTCTTTTAAATACAATCTTCCTGCTCAGTAGCGCATGATTATCGTTGTTGCTAGCCAGTGTGGTAAGTAACAGCACCACTGCGAGCCTAATGTGCCCTTTCCACGAACACAAGGCTATCCGATCCTATATTAGGATTCCGCAATGGGGTTAGCAAATCGCACCCTAAACGATATTGAAGACTTGCGATGTACATGCTTTGGTACAATACATACGTGTTCCAGTTGTTATCCTGTATCGGAACTTCAATTATGCATCGCACCAGCATATTCATGTCATCTAGGAAGAGCGCGTAGGATAAATAATTCAATTAAGATGTCGTTATGCTAGTATACGTCTACCCGTCACCGGCCATCTGTGTGCAGATGGGGCGACGAGTTATTGACCCTGATTTCTCCACTTCTAATACCACACACTGGGCAATACGAGCTCAAGCTAGTCTCGCAGTAACGCTCATCAGCTAACGAAAGAGTTAAAGGCTCGCTAATTCGCACTGTCAGGGTCTCTTGGGTGTTTTGCACTAGCGTCAGGTAGGCTAGTATGTGTTTTTCCTTCCAGAGGTATGTGGCTGCGTGGTCAAATGTGCAGCATACGTATTTGCTCGACGTGTTTAGTCTCTCATACTTCTCCTGGAGATCAAGGAAATGTTTCTTGTCCAAGTGGACAACGGTTCTACGGAATGGATCTACGTTACTGCCTGCATAAAGAAAACGGAGTTGCTAAGGACGAAAGCGACTTTAGGTTCTAACTGTTGACTTTGGCGGAAAAGTTTCATTCAGGAAGCAGACACTGATTGACACGGTTTAGCAGAACGTTTGAGGATTAGGTTAAATTGAGTGGTTTAATATTGGTATGTCTGGGATTAAAATATAGTATAGTGTGTTAATCGGAGACGAATTAAAGACACGAGTTCCCAAAATCAAGCGGGCTCATTACAACGGTTAATCCTGGTAGTTTACGTGAACAATGTTCTGAAGAAAATTTATGAAAAAAGGACCCGTCATCGCCTACAATTACCTACAACGGTCGACCATACCTTCGATTATCGTGGCCACTCTCGGATTACACGGCAGAGGTGGTTGTGTTCCGATAGGCCAGTATATTATTCTAAGGCGTTACCCTAATCATTTTTCATCGGATTTGCTATAGCCCTTGAACGCTACATGCACGAAACCAAATTATGTATACACTGGGTCATCAATAGGATATAGTCTTGTAGTTAACATGTAGCCCGGCCGTATTAGTACAGTAGAGCCTTCATTGACATTCTGTTTATTAAATTATTTCTACAGCAAAACGATCATATGCAAATCCACAGTGCGCGATAGAGATACATTCACTCGGCTGCTCTGTAATAGGGACTAAAAAAGTGATGATTATCATGAGTGCCCCGTTATGGTCGTGTTCGATCAGAGCGCTCTTACGAGCAGTCGTATACTTTCTCGAATTCCGTGCAGTTAAGCGTGACAGTCCCAGTGAACCCACAAAACGTGATGGCAGTCCATGCAATCATACGCAAGAAGGATGGTCTCCAGACACCGGCGCACCAGTTTTCACGCCGAAAGCATAAACGAGGAGCACAAATGAAAGTGTTTGAACTGGACCTGTAGTTTCTCTACGAAAAATACCTTGAGCTGTTGCGTTGTTGCGCTGCCTAGATGCAGTGTTGCACATATCACTTTTGCTTCAACGACTGCTGCTTTCGCTGTAACCCTAGACAGACAACAATAAGCGCTTTTTGTAGGCAAGAGCTCCGCCTATGACTAACTGCGCCAAAACATCTTCCAATCCCCTTATCCAATTTAATTCATCGAATTCTTACAATTTAGACCCTAATATCACATCATTAGACATTAATTGCCTCTGCCAAAATTCTGTCTACAAATGTTTTAGTTCGCTCCAGTAAAGTTGTTAATAACGACTACTAAATCCGCATGTTACGGGATTTCTTATTAATTCTTTTTTCGTAAGGAACAGCGGATCTTAATGGATGGCGCCAGGTGGTATGGAAGCTAATAGCGCGGGTGAGAGGGTAATTAGCCGTCTTCACCAACACAACGCTATCGGGTCATACTATAAGATTCCACAATGCGACTACTTATAAGATGTCTTAACGGTATCCGCAACTTGTGATGTGCCTACTATGCTTAAATGCATATCTCGCTCAGTAACTTTCCAATATGAGAGCATCAATTGTAGATCGGGCCGAGATAATCATGTCGTCACGGAACTTATTGTAAGAGTAATAATTTAAAAGAGATGTCAGTTTGCTGGTTCACGTAAAGGTTCCTCACACTACCTCTAAATAAGTGAGCGGTCGTGACATTATCCCTGATTTTCTCACTACTATTAGTACTCACGACACAATTCTACCACAGCCTTGTTTCGCCAGAATGCCAGTCAGCATAAAGAAGAGCTCAAGGCAGGTCAACTCGCATTGTGAGAGTTACATGAACGTTCGGCACTACCGACACGAACCTCAGTTAGCGTACATCCTACCAGAGGTCTGTGGCCCCGTGGTCAAAAGTGCGGATTTCGTATTTGCTGCTCGTCAGTACTTTCAGAATCATGACCTGCACGGTAAAAAGACGCTTATTATGGAGTTCGACATGGCAATAACGCGACGAATCTACGTCATGACGAGAATAGTATAAACAAAACTGCTGACGGCAGAAGCGTCAAAGAAGTCTGTAAATTGTTATTCGCGAAAAACATCCGTCTCCGTGGGGGATAATCACCGACGCCATTTTATAGAAGCCTAGGGGAACAGATTGGTTTAATTAGCTTAAGAAAGTAAATTCTGGGATTATACTGTAGTAATCACTAATTTACGGTGAGGGTTTTATGGCGGATTTTTACAAATTCAAACCAGGTGATTTCAACAAATTTTGTTGACGATTTAGGCGCACTATCCCCTAAACTACAAATTAAAAAATAGCGTTCCTTGACGGCTAGAATTACTTACCGGCCTTCACCATACCTTCGATATTCGCGCCCACTCTCCCATTAATCCGTACAAGTGGATGTAATGCGATTGTCCGCTAAGATATTCTAACGTGTAACGTAGATAAGTATTTTACAGAGTTGCCGTACGCGTTGAACACTTCACAGATGATAGGAATTTGCGTATAGAGCGTGTTATTGAGGAGTTATACACCCGTAGACTACAATGGGCCCAACTCAATCAGAACTCGAGTGCCTTGAATAACATACTCATCACTAAACATTCTCAACAATCAATCGAGCAAGTCCATTATCAACGAGTGTGTTGCAGTTTTATTCTCTTGCCAGCATTGTAATAGGCACTAAAAGAATGATGATAGTCATGAGTACTGAGCTAAGACGGCGTCGATGCATAGCGGACTTTCGGTCAATCACAATTCCTCACGAGACTCGTCCTGTTGAGCGTATCACTCTCAATGTACAAGCAACCCAAGAAGGCTGTGCCTGGACTCAACTGGATGCAGGATGAACTCCAGACACGGGGTCACTACTCTTCATACATAAAGCAAGAACGTCGAACAGTCATGAAAGTCTTAGTACCGCACGTACCATCTTACTGTGAATATTGCTTGAAGCTGTACCGTTATTGGGGGGCAAAGATGAAGTTCTCTTCTTTTCATAATTGTACTGACGACAGTCGTGTTCTCGGTTTCTTCAAAGGTTAAAGAATAAAGGCTTATTGTAGGCAGAGGAACGCCCTTTTAGTGGCTGGCGTTAAGTATCTTCGGACCCCCTTGTCTATCCAGATTAATCGAATTCTCTCATTTAGGACCTTAGTAAGTCATCATTGGTATTTGAATGCGACCTTGAAGAAACCGCTTAAAAATGTCAATGGTTGATCCACTAAACTTCATTTAATTAACTCCTAAATCAGCGCGATAGGCTATTAGAGGTTTAATTTTGTATAGCAAGGTACTTCCGATCTTAATGAATGGCCGGAAAAGGTACGGACGCGATATGCGAGGGTGAAAGGGCAAATAGACAGGTTCGTCTTTGTCACGCTAGGAGGCAATTCTATAAGAATGCATATTGCATCGATACATAAAATGTCTCGATCGCATGCGCAATTTGTGAAGTGTCTATTATCCCTAAGCCCATTTCCCGCATAATAACCCCTGATTGTATCCGCATTTGATGCTACCCAGGTTGAGTTAGCGTCGAGCTCGCGGAACTTATTGCATGAGTAGAGTTGAGTAAGAGCTGTTAGATGGCTCGCTGAACTAATAGTTGTCCACAGAACGTCAAGATTAGAAAACGGTTGTAGCATTATCGGAGGTTCTCTAACTACTATCAATACCCGTGTCTTGACTCTGCTGCGGCTACCTATCGCCTGAAAACCAGTTGGTGTTAAGGGATGCTCTGTCCAGGACGCCACATGTAGTGAAACTTACATGTTCGTTGGGTTCACCCGACT";
         let score = |a: u8, b: u8| if a == b { 1 } else { -1 };
         let aligner = super::FastLSAAligner::with(a, b, score);
         let alignment = aligner.align();
+        println!("FINAL ALIGNMENT:\n{}", alignment);
     }
 }

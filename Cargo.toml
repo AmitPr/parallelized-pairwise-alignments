@@ -18,5 +18,9 @@ harness = false
 name = "parallel"
 harness = false
 
+[[bench]]
+name = "fast_lsa"
+harness = false
+
 [profile.release]
 debug = true
