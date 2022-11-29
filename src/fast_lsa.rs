@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)]
 use std::sync::{Arc, Mutex};
 
 use crate::{Aligner, Alignment};
@@ -316,9 +317,9 @@ impl<'a> FastLSAAligner<'a> {
             }
         }
         scores[0] = start_row.as_ref().to_vec();
-        for i in 0..m {
+        for i in 0..start_idx.1.max(m) {
             scores[i + 1][0] = start_col.as_ref()[i + 1];
-            for j in 0..n {
+            for j in 0..start_idx.0.max(n) {
                 let nexts = vec![
                     (scores[i][j] + score(a[j], b[i]), Direction::Diagonal), // substitution
                     (scores[i][j + 1] + score(b'-', b[i]), Direction::Up),   // deletion
@@ -337,13 +338,7 @@ impl<'a> FastLSAAligner<'a> {
         let mut i = start_idx.0;
         let mut j = start_idx.1;
         let mut alignment = Vec::new();
-        let condition = |i: usize, j: usize| {
-            if row == 0 && col == 0 {
-                i > 0 || j > 0
-            } else {
-                i > 0 && j > 0
-            }
-        };
+
         while backtrack[j][i] != Direction::None {
             match backtrack[j][i] {
                 Direction::Diagonal => {
@@ -362,6 +357,7 @@ impl<'a> FastLSAAligner<'a> {
                 _ => unreachable!(),
             }
         }
+
         alignment.reverse();
         let alignment = Alignment {
             score: scores[start_idx.1][start_idx.0],
