@@ -1,6 +1,6 @@
 [package]
-name = "parallel_hirschberg"
-version = "0.1.0"
+name = "pairwise"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
@@ -20,6 +20,10 @@ harness = false
 
 [[bench]]
 name = "fast_lsa"
+harness = false
+
+[[bench]]
+name = "comparison"
 harness = false
 
 [profile.release]

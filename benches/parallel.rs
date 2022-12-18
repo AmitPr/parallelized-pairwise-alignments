@@ -6,8 +6,8 @@ use std::{
 };
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use parallel_hirschberg::parallel::ParallelHirschbergAligner;
-use parallel_hirschberg::Aligner;
+use pairwise::parallel::ParallelHirschbergAligner;
+use pairwise::Aligner;
 use pprof::criterion::{Output, PProfProfiler};
 
 fn bench_group(c: &mut Criterion) {

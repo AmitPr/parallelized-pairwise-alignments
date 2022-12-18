@@ -6,6 +6,16 @@ pub struct Alignment {
     pub score: i32,
     pub alignment: Vec<(char, char)>,
 }
+
+impl Alignment {
+    pub fn verify(&self, score: fn(u8, u8) -> i32) -> bool {
+        let score = self.alignment.iter().fold(0, |acc, (c1, c2)| {
+            acc + score(*c1 as u8, *c2 as u8)
+        });
+        score == self.score
+    }
+}
+
 impl std::fmt::Display for Alignment {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
         let s1 = self.alignment.iter().map(|(c, _)| c).collect::<String>();

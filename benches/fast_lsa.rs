@@ -6,21 +6,31 @@ use std::{
 };
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use parallel_hirschberg::fast_lsa::FastLSAAligner;
-use parallel_hirschberg::Aligner;
+use pairwise::fast_lsa::FastLSAAligner;
+use pairwise::Aligner;
 use pprof::criterion::{Output, PProfProfiler};
 
 fn bench_group(c: &mut Criterion) {
     let mut group = c.benchmark_group("FastLSA");
     for file in &["short.txt", "medium.txt"] {
-        let (seq_1, seq_2) = read_sequences(file);
-        group.bench_with_input(*file, &(seq_1, seq_2), |b, (seq_1, seq_2)| {
-            b.iter(|| {
-                let aligner =
-                    FastLSAAligner::with(black_box(seq_1), black_box(seq_2), black_box(SCORER));
-                aligner.align();
-            })
-        });
+        for block_size in &[50, 75, 150, 250, 400] {
+            let (seq_1, seq_2) = read_sequences(file);
+            group.bench_with_input(
+                format!("{block_size}-{file}"),
+                &(seq_1, seq_2),
+                |b, (seq_1, seq_2)| {
+                    b.iter(|| {
+                        let aligner = FastLSAAligner::with(
+                            black_box(seq_1),
+                            black_box(seq_2),
+                            black_box(SCORER),
+                        )
+                        .with_block_size(*block_size);
+                        aligner.align();
+                    })
+                },
+            );
+        }
     }
 }
 

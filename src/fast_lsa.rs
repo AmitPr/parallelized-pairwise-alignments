@@ -116,11 +116,11 @@ impl<'a> Aligner<'a> for FastLSAAligner<'a> {
             }
             // (sub_alignment, start_idx, next_row, next_col)
             start_idx = result.1;
-            if next_col != 0 && start_idx.0 == 0{
+            if next_col != 0 && start_idx.0 == 0 {
                 start_idx.0 = self.block_size
             }
 
-            if next_row != 0 && start_idx.1 == 0{
+            if next_row != 0 && start_idx.1 == 0 {
                 start_idx.1 = self.block_size
             }
 
@@ -154,7 +154,7 @@ impl<'a> FastLSAAligner<'a> {
         self
     }
 
-    pub fn forward(
+    fn forward(
         &self,
         cell: (usize, usize),
         row_cache: Cache<i32>,
@@ -174,12 +174,6 @@ impl<'a> FastLSAAligner<'a> {
         let row_end = ((col + 1) * self.block_size).min(self.a.len());
         let col_start = row * self.block_size;
         let col_end = ((row + 1) * self.block_size).min(self.b.len());
-
-        // println!("Filling in cell ({}, {})", row, col);
-        // println!(
-        //     "rs: {}, re: {}, cs: {}, ce: {}",
-        //     row_start, row_end, col_start, col_end
-        // );
 
         let start_row = row_cache[row].lock().unwrap()[row_start..=row_end].to_vec();
         let start_col = col_cache[col].lock().unwrap()[col_start..=col_end].to_vec();
@@ -239,7 +233,7 @@ impl<'a> FastLSAAligner<'a> {
         );
     }
 
-    pub fn fill_grid_block(
+    fn fill_grid_block(
         a: &[u8],
         b: &[u8],
         start_row: impl AsRef<[i32]>,
@@ -276,7 +270,7 @@ impl<'a> FastLSAAligner<'a> {
     }
 
     /// Returns: (alignment, next_start_idx, next_row, next_col)
-    pub fn backtrace_grid_cell(
+    fn backtrace_grid_cell(
         cell: (usize, usize),
         a: &[u8],
         b: &[u8],
@@ -293,15 +287,6 @@ impl<'a> FastLSAAligner<'a> {
             Up,
         }
         let (row, col) = cell;
-        // println!(
-        //     "Backward: row: {}, col: {}, start: ({}, {}), a: {:?}, b: {:?}",
-        //     row,
-        //     col,
-        //     start_idx.0,
-        //     start_idx.1,
-        //     String::from_utf8_lossy(a),
-        //     String::from_utf8_lossy(b)
-        // );
         let n = a.len();
         let m = b.len();
         let mut scores = vec![vec![0; n + 1]; m + 1];
