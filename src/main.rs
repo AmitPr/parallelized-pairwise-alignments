@@ -144,8 +144,9 @@ fn run_fast_lsa(x: &[u8], y: &[u8], output_file: Option<std::fs::File>) {
             -1
         }
     };
+    let block_size = (x.len().max(y.len()) / 99).max(10);
     let start = Instant::now();
-    let aligner = FastLSAAligner::with(x, y, score).with_block_size(500);
+    let aligner = FastLSAAligner::with(x, y, score).with_block_size(block_size);
     let aln = aligner.align();
     println!(
         "Fast LSA: Score: {} Time: {}",
